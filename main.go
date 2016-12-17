@@ -19,7 +19,7 @@ var C = struct {
 
 	AccessLogFile, Target, Scheme *string
 }{
-	Low:           flag.Int("low", 0, "RPS value to start test with"),
+	Low:           flag.Int("low", 1, "RPS value to start test with"),
 	High:          flag.Int("high", 60, "RPS value to finish test with"),
 	Duration:      flag.Duration("d", time.Minute, "test duration"),
 	AccessLogFile: flag.String("f", "access.log", "access.log file location"),
@@ -35,10 +35,6 @@ func main() {
 	Low := float64(*C.Low)
 	Duration := *C.Duration
 
-	rpsAt := func(t time.Duration) float64 {
-		return Low + (High-Low)*float64(t)/float64(Duration)
-	}
-
 	f, err := os.Open(*C.AccessLogFile)
 	if err != nil {
 		log.Fatalf("Can't open access log file: %s", err)
@@ -47,15 +43,16 @@ func main() {
 	s := bufio.NewScanner(f)
 
 	seconds := C.Duration.Seconds()
-	count := int(((High-Low)/2 + Low) * seconds)
+	count := int((Low + High) / 2 * seconds)
 	fmt.Printf("Total request count: %d\n", count)
 	times := make([]time.Duration, count)
 
-	// for final RPS to be equal to High, last interval between requests
-	// should be equal to time.Second / High
-	times[count-1] = Duration - time.Duration(float64(time.Second)/High)
+	rpsAt := func(t time.Duration) float64 {
+		return Low + (High-Low)*float64(t)/float64(Duration)
+	}
+
+	times[count-1] = Duration
 	for i := count - 2; i >= 0; i-- {
-		// calculate interval for previous request in the same way
 		times[i] = times[i+1] - time.Duration(float64(time.Second)/rpsAt(times[i+1]))
 	}
 
