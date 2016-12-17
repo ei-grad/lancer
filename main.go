@@ -27,57 +27,74 @@ var C = struct {
 	Scheme:        flag.String("s", "http", "scheme"),
 }
 
+// Parse access.log file, construct http.Request objects and put them to
+// spears channel
+func Parse(filename string, spears chan *http.Request) {
+	f, err := os.Open(*C.AccessLogFile)
+	if err != nil {
+		log.Printf("Can't open access log file: %s", err)
+		return
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := s.Text()
+		parts := strings.Split(line, " ")
+		fmt.Printf("%+v\n", parts)
+		method := parts[5][1:]
+		path := parts[6]
+		req, err := http.NewRequest(method, fmt.Sprintf("%s://%s%s", *C.Scheme, *C.Target, path), nil)
+		if err != nil {
+			log.Printf("NewRequest failed: %s", err)
+			continue
+		}
+		spears <- req
+	}
+	if s.Err() != nil {
+		log.Printf("Error reading %s: %s", filename, s.Err())
+	}
+}
+
+// Lancer generates linearly increasing load of HTTP requests
+type Lancer struct {
+	low, high float64
+	duration  time.Duration
+}
+
+// NewLancer creates a new Lancer object
+func NewLancer(low, high float64, duration time.Duration) *Lancer {
+	return &Lancer{
+		low:      low,
+		high:     high,
+		duration: duration,
+	}
+}
+
+// RPSAt calculates an RPS value which should be generated at `t` since load generation start.
+func (l *Lancer) RPSAt(t time.Duration) float64 {
+	return l.low + (l.high-l.low)*float64(t)/float64(l.duration)
+}
+
+// Count of requests to be sent
+func (l *Lancer) Count() int {
+	return int((l.low + l.high) / 2 * l.duration.Seconds())
+}
+
 func main() {
 
 	flag.Parse()
 
-	High := float64(*C.High)
-	Low := float64(*C.Low)
-	Duration := *C.Duration
-
-	f, err := os.Open(*C.AccessLogFile)
-	if err != nil {
-		log.Fatalf("Can't open access log file: %s", err)
-	}
-	defer f.Close()
-	s := bufio.NewScanner(f)
-
-	seconds := C.Duration.Seconds()
-	count := int((Low + High) / 2 * seconds)
-	fmt.Printf("Total request count: %d\n", count)
+	lancer := NewLancer(float64(*C.High), float64(*C.Low), *C.Duration)
+	count := lancer.Count()
 	times := make([]time.Duration, count)
-
-	rpsAt := func(t time.Duration) float64 {
-		return Low + (High-Low)*float64(t)/float64(Duration)
-	}
-
-	times[count-1] = Duration
+	times[count-1] = *C.Duration
 	for i := count - 2; i >= 0; i-- {
-		times[i] = times[i+1] - time.Duration(float64(time.Second)/rpsAt(times[i+1]))
+		times[i] = times[i+1] - time.Duration(float64(time.Second)/lancer.RPSAt(times[i+1]))
 	}
-
-	fmt.Printf("Request schedule: %+v\n", times)
 
 	spears := make(chan *http.Request)
 
-	go func() {
-		for s.Scan() {
-			line := s.Text()
-			parts := strings.Split(line, " ")
-			fmt.Printf("%+v\n", parts)
-			method := parts[5][1:]
-			path := parts[6]
-			req, err := http.NewRequest(method, fmt.Sprintf("%s://%s%s", *C.Scheme, *C.Target, path), nil)
-			if err != nil {
-				log.Fatalf("NewRequest failed: %s", err)
-			}
-			spears <- req
-		}
-		if s.Err() != nil {
-			// XXX: We may want to dump our current state and exit gracefully at this point.
-			log.Println("Error reading STDIN: ", s.Err())
-		}
-	}()
+	go Parse(*C.AccessLogFile, spears)
 
 	lance := make(chan struct{})
 
@@ -133,15 +150,5 @@ func main() {
 		time.Sleep(dt)
 		lance <- struct{}{}
 	}
-
-	// terminate the scanner
-	f.Seek(0, 2)
-	<-spears
-	// XXX: broken teardown
-	close(spears)
-	close(lance)
-
-	// wait for pending requests to be send and statistics to be saved
-	<-finished
 
 }
