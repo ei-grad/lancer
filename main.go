@@ -19,8 +19,8 @@ var C = struct {
 
 	AccessLogFile, Target, Scheme *string
 }{
-	Low:           flag.Int("low", 1, "RPS value to start test with"),
-	High:          flag.Int("high", 60, "RPS value to finish test with"),
+	Low:           flag.Int("l", 1, "RPS value to start test with"),
+	High:          flag.Int("h", 60, "RPS value to finish test with"),
 	Duration:      flag.Duration("d", time.Minute, "test duration"),
 	AccessLogFile: flag.String("f", "access.log", "access.log file location"),
 	Target:        flag.String("t", "localhost", "target"),
@@ -40,7 +40,6 @@ func Parse(filename string, spears chan *http.Request) {
 	for s.Scan() {
 		line := s.Text()
 		parts := strings.Split(line, " ")
-		fmt.Printf("%+v\n", parts)
 		method := parts[5][1:]
 		path := parts[6]
 		req, err := http.NewRequest(method, fmt.Sprintf("%s://%s%s", *C.Scheme, *C.Target, path), nil)
@@ -70,28 +69,38 @@ func NewLancer(low, high float64, duration time.Duration) *Lancer {
 	}
 }
 
-// RPSAt calculates an RPS value which should be generated at `t` since load generation start.
+// RPSAt calculates an RPS value which should be generated at `t` since start.
 func (l *Lancer) RPSAt(t time.Duration) float64 {
 	return l.low + (l.high-l.low)*float64(t)/float64(l.duration)
 }
 
-// Count of requests to be sent
-func (l *Lancer) Count() int {
-	return int((l.low + l.high) / 2 * l.duration.Seconds())
+// Next calculates the interval to sleep after the request sent at `t` since start.
+func (l *Lancer) Next(t time.Duration) time.Duration {
+	return time.Duration(float64(time.Second) / l.RPSAt(t))
+}
+
+// Start to simulate load with ticks sent to lance channel.
+func (l *Lancer) Start(lance chan struct{}) {
+	t := time.Duration(0)
+	start := time.Now()
+	finish := start.Add(l.duration)
+	for finish.After(time.Now()) {
+		lance <- struct{}{}
+		t += l.Next(t)
+		dt := start.Add(t).Sub(time.Now())
+		if dt < 0 {
+			log.Printf("Missed time for lance at %s", t)
+			continue
+		}
+		time.Sleep(dt)
+	}
 }
 
 func main() {
 
 	flag.Parse()
 
-	lancer := NewLancer(float64(*C.High), float64(*C.Low), *C.Duration)
-	count := lancer.Count()
-	times := make([]time.Duration, count)
-	times[count-1] = *C.Duration
-	for i := count - 2; i >= 0; i-- {
-		times[i] = times[i+1] - time.Duration(float64(time.Second)/lancer.RPSAt(times[i+1]))
-	}
-
+	lancer := NewLancer(float64(*C.Low), float64(*C.High), *C.Duration)
 	spears := make(chan *http.Request)
 
 	go Parse(*C.AccessLogFile, spears)
@@ -140,15 +149,6 @@ func main() {
 		close(finished)
 	}()
 
-	start := time.Now()
-	for i := 0; i < count; i++ {
-		dt := start.Add(times[i]).Sub(time.Now())
-		if dt < 0 {
-			log.Printf("Missed time for lance %d", i)
-			continue
-		}
-		time.Sleep(dt)
-		lance <- struct{}{}
-	}
+	lancer.Start(lance)
 
 }
