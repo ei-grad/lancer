@@ -8,6 +8,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -29,7 +30,8 @@ func Parse(ctx context.Context, filename, scheme, target string, spears chan *ht
 		// TODO: check method and path validity
 		method := parts[5][1:]
 		path := parts[6]
-		req, err := http.NewRequest(method, fmt.Sprintf("%s://%s%s", scheme, target, path), nil)
+		url := fmt.Sprintf("%s://%s%s", scheme, target, path)
+		req, err := http.NewRequest(method, url, nil)
 		if err != nil {
 			log.Printf("NewRequest failed: %s", err)
 			continue
@@ -50,42 +52,55 @@ func Parse(ctx context.Context, filename, scheme, target string, spears chan *ht
 type Lancer struct {
 	low, high float64
 	duration  time.Duration
+
+	lowSq, slope, durationSeconds float64
 }
 
 // NewLancer creates a new Lancer object
 func NewLancer(low, high float64, duration time.Duration) *Lancer {
+	if low == high {
+		return nil
+	}
+	durationSeconds := float64(duration) / float64(time.Second)
 	return &Lancer{
-		low:      low,
-		high:     high,
-		duration: duration,
+		low:             low,
+		high:            high,
+		duration:        duration,
+		lowSq:           low * low,
+		slope:           (high - low) / durationSeconds,
+		durationSeconds: durationSeconds,
 	}
 }
 
-// RPSAt calculates an RPS value at `t`.
-func (l *Lancer) RPSAt(t time.Duration) float64 {
-	return l.low + (l.high-l.low)*float64(t)/float64(l.duration)
-}
-
-// Next calculates the interval between `t` and the next request.
-func (l *Lancer) Next(t time.Duration) time.Duration {
-	return time.Duration(float64(time.Second) / l.RPSAt(t))
+func (l *Lancer) tickTime(n int) time.Duration {
+	ret := (math.Sqrt(l.lowSq+2*l.slope*float64(n)) - l.low) / l.slope
+	return time.Duration(ret * float64(time.Second))
 }
 
 // Lance starts a load simulation with sending ticks to lance channel.
-func (l *Lancer) Lance(lance chan struct{}) {
-	t := time.Duration(0)
+func (l *Lancer) Lance(ctx context.Context, lance chan struct{}) error {
+	count := int((l.high + l.low) * l.durationSeconds / 2)
 	start := time.Now()
-	finish := start.Add(l.duration)
-	for finish.After(time.Now()) {
-		lance <- struct{}{}
-		t += l.Next(t)
-		dt := start.Add(t).Sub(time.Now())
+	select {
+	case lance <- struct{}{}:
+	case <-ctx.Done():
+		return nil
+	}
+	for i := 1; i < count+1; i++ {
+		tickTime := l.tickTime(i)
+		dt := start.Add(tickTime).Sub(time.Now())
 		if dt < 0 {
-			log.Printf("Missed time for lance at %s", t)
-			continue
+			return fmt.Errorf("missed time for lance %d: %s -> %s",
+				i, l.tickTime(i-1), l.tickTime(i))
 		}
 		time.Sleep(dt)
+		select {
+		case lance <- struct{}{}:
+		case <-ctx.Done():
+			return nil
+		}
 	}
+	return nil
 }
 
 // Hit contains info about request timings, sizes and statuses
@@ -132,7 +147,7 @@ func Worker(ctx context.Context, spears chan *http.Request, lance chan struct{},
 
 func main() {
 
-	low := flag.Int("l", 1, "RPS value to start test with")
+	low := flag.Int("l", 0, "RPS value to start test with")
 	high := flag.Int("h", 60, "RPS value to finish test with")
 	duration := flag.Duration("d", time.Minute, "test duration")
 	filename := flag.String("f", "access.log", "access.log file location")
@@ -142,20 +157,21 @@ func main() {
 	flag.Parse()
 
 	spears := make(chan *http.Request)
-	defer close(spears)
-
 	lance := make(chan struct{})
-	defer close(lance)
-
 	hits := make(chan Hit)
-	defer close(hits)
 
 	ctx, stop := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error { return Parse(ctx, *filename, *scheme, *target, spears) })
+	g.Go(func() error {
+		defer close(spears)
+		return Parse(ctx, *filename, *scheme, *target, spears)
+	})
 
-	g.Go(func() error { Worker(ctx, spears, lance, hits); return nil })
+	g.Go(func() error {
+		defer close(hits)
+		return Worker(ctx, spears, lance, hits)
+	})
 
 	g.Go(func() error {
 		// TODO: influxdb output
@@ -167,9 +183,12 @@ func main() {
 		return nil
 	})
 
-	NewLancer(float64(*low), float64(*high), *duration).Lance(lance)
-
-	stop()
+	g.Go(func() error {
+		defer stop()
+		defer close(lance)
+		lancer := NewLancer(float64(*low), float64(*high), *duration)
+		return lancer.Lance(ctx, lance)
+	})
 
 	err := g.Wait()
 	if err != nil {
