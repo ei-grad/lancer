@@ -19,7 +19,7 @@ import (
 
 // Parse access.log file, construct http.Request objects and put them to
 // spears channel
-func Parse(ctx context.Context, filename, scheme, target string, spears chan *http.Request) error {
+func Parse(ctx context.Context, filename, scheme, target string, spears chan *http.Request, cancelRequestsOnStop bool) error {
 	f, err := os.Open(filename)
 	if err != nil {
 		return err
@@ -34,6 +34,9 @@ func Parse(ctx context.Context, filename, scheme, target string, spears chan *ht
 		path := parts[6]
 		url := fmt.Sprintf("%s://%s%s", scheme, target, path)
 		req, err := http.NewRequest(method, url, nil)
+		if cancelRequestsOnStop {
+			req = req.WithContext(ctx)
+		}
 		if err != nil {
 			return fmt.Errorf("can't construct request: %s", err)
 		}
@@ -158,6 +161,7 @@ func main() {
 	target := flag.String("t", "localhost", "target")
 	scheme := flag.String("s", "http", "scheme")
 	numWorkers := flag.Int("w", 1024, "max number of concurrent requests")
+	cancelRequestsOnStop := flag.Bool("x", false, "don't wait for pending requests after finish")
 
 	flag.Parse()
 
@@ -167,11 +171,12 @@ func main() {
 	hits := make(chan Hit, 10000)
 
 	ctx, stop := context.WithCancel(context.Background())
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		defer close(spears)
-		return Parse(ctx, *filename, *scheme, *target, spears)
+		return Parse(ctx, *filename, *scheme, *target, spears, *cancelRequestsOnStop)
 	})
 
 	readyWorkers = make(chan int, 100)
