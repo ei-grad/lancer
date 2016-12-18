@@ -58,10 +58,12 @@ type Lancer struct {
 	duration  time.Duration
 
 	lowSq, slope, durationSeconds float64
+
+	missedFrac int
 }
 
 // NewLancer creates a new Lancer object
-func NewLancer(low, high float64, duration time.Duration) *Lancer {
+func NewLancer(low, high float64, duration time.Duration, missedFrac int) *Lancer {
 	durationSeconds := float64(duration) / float64(time.Second)
 	return &Lancer{
 		low:             low,
@@ -70,6 +72,7 @@ func NewLancer(low, high float64, duration time.Duration) *Lancer {
 		lowSq:           low * low,
 		slope:           (high - low) / durationSeconds,
 		durationSeconds: durationSeconds,
+		missedFrac:      missedFrac,
 	}
 }
 
@@ -83,6 +86,7 @@ func (l *Lancer) tickTime(n int) time.Duration {
 
 // Lance starts a load simulation with sending ticks to lance channel.
 func (l *Lancer) Lance(ctx context.Context, lance chan time.Duration) error {
+	var missed int
 	count := int((l.high + l.low) * l.durationSeconds / 2)
 	start := time.Now()
 	select {
@@ -94,10 +98,17 @@ func (l *Lancer) Lance(ctx context.Context, lance chan time.Duration) error {
 		tickTime := l.tickTime(i)
 		dt := start.Add(tickTime).Sub(time.Now())
 		if dt < 0 {
-			return fmt.Errorf("missed time for lance near %.1f RPS",
-				float64(time.Second)/float64(l.tickTime(i)-l.tickTime(i-1)))
+			missed++
+			rps := float64(time.Second) / float64(l.tickTime(i)-l.tickTime(i-1))
+			log.Printf("missed %s for lance near %.1f RPS", dt, rps)
+			if l.missedFrac*missed > count {
+				return fmt.Errorf("max missed fraction reached at %.1f RPS", rps)
+			}
+			continue
 		}
-		time.Sleep(dt)
+		if dt > time.Millisecond {
+			time.Sleep(dt)
+		}
 		select {
 		case lance <- tickTime:
 		case <-ctx.Done():
@@ -161,6 +172,7 @@ func main() {
 	target := flag.String("t", "localhost", "target")
 	scheme := flag.String("s", "http", "scheme")
 	numWorkers := flag.Int("w", 1024, "max number of concurrent requests")
+	missedFrac := flag.Int("q", 100, "max fraction of missed lances")
 	cancelRequestsOnStop := flag.Bool("x", false, "don't wait for pending requests after finish")
 
 	flag.Parse()
@@ -227,7 +239,7 @@ func main() {
 
 	g.Go(func() error {
 		defer stop()
-		lancer := NewLancer(float64(*low), float64(*high), *duration)
+		lancer := NewLancer(float64(*low), float64(*high), *duration, *missedFrac)
 		return lancer.Lance(ctx, lance)
 	})
 
