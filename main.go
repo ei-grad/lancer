@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"golang.org/x/sync/errgroup"
@@ -78,11 +79,11 @@ func (l *Lancer) tickTime(n int) time.Duration {
 }
 
 // Lance starts a load simulation with sending ticks to lance channel.
-func (l *Lancer) Lance(ctx context.Context, lance chan struct{}) error {
+func (l *Lancer) Lance(ctx context.Context, lance chan time.Duration) error {
 	count := int((l.high + l.low) * l.durationSeconds / 2)
 	start := time.Now()
 	select {
-	case lance <- struct{}{}:
+	case lance <- time.Duration(0):
 	case <-ctx.Done():
 		return nil
 	}
@@ -95,7 +96,7 @@ func (l *Lancer) Lance(ctx context.Context, lance chan struct{}) error {
 		}
 		time.Sleep(dt)
 		select {
-		case lance <- struct{}{}:
+		case lance <- tickTime:
 		case <-ctx.Done():
 			return nil
 		}
@@ -107,19 +108,25 @@ func (l *Lancer) Lance(ctx context.Context, lance chan struct{}) error {
 // TODO: add ConnectTime, SendTime, ReceiveTime, SizeOut, NetCode
 type Hit struct {
 	Timestamp         time.Time
-	TotalTime         time.Duration
+	Tick, TotalTime   time.Duration
 	SizeIn, ProtoCode int
 	Error             error
 }
 
+var readyWorkers chan int
+
 // Worker sends an http.Requests coming from spears channel
-func Worker(ctx context.Context, spears chan *http.Request, lance chan struct{}, hits chan Hit) error {
+func Worker(ctx context.Context, spears chan *http.Request,
+	lance chan time.Duration, hits chan Hit) error {
 	for spear := range spears {
+		var tick time.Duration
+		readyWorkers <- 1
 		select {
-		case <-lance:
+		case tick = <-lance:
 		case <-ctx.Done():
 			return nil
 		}
+		readyWorkers <- -1
 		t := time.Now()
 		resp, err := http.DefaultTransport.RoundTrip(spear)
 		if err != nil {
@@ -133,6 +140,7 @@ func Worker(ctx context.Context, spears chan *http.Request, lance chan struct{},
 		// TODO: use httptrace module to get additional info
 		hits <- Hit{
 			Timestamp: t,
+			Tick:      tick,
 			ProtoCode: resp.StatusCode,
 			TotalTime: time.Now().Sub(t),
 			SizeIn:    len(body),
@@ -149,11 +157,13 @@ func main() {
 	filename := flag.String("f", "access.log", "access.log file location")
 	target := flag.String("t", "localhost", "target")
 	scheme := flag.String("s", "http", "scheme")
+	numWorkers := flag.Int("w", 1024, "max number of concurrent requests")
 
 	flag.Parse()
 
 	spears := make(chan *http.Request)
-	lance := make(chan struct{})
+	lance := make(chan time.Duration)
+	defer close(lance)
 	hits := make(chan Hit, 10000)
 
 	ctx, stop := context.WithCancel(context.Background())
@@ -164,10 +174,13 @@ func main() {
 		return Parse(ctx, *filename, *scheme, *target, spears)
 	})
 
+	readyWorkers = make(chan int, 100)
+	defer close(readyWorkers)
+
 	g.Go(func() error {
 		defer close(hits)
 		var wg sync.WaitGroup
-		for i := 0; i < 10240; i++ {
+		for i := 0; i < *numWorkers; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -178,19 +191,37 @@ func main() {
 		return nil
 	})
 
+	var workersReady int
+	for workersReady < *numWorkers {
+		workersReady += <-readyWorkers
+	}
+
+	g.Go(func() error {
+		for {
+			select {
+			case d := <-readyWorkers:
+				workersReady += d
+				if workersReady == 0 {
+					return errors.New("No ready workers left!")
+				}
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	})
+
 	g.Go(func() error {
 		// TODO: influxdb output
 		// TODO: phout output
 		// TODO: overload.yandex.ru output
 		for hit := range hits {
-			fmt.Printf("%+v\n", hit)
+			fmt.Printf("%v\n", hit)
 		}
 		return nil
 	})
 
 	g.Go(func() error {
 		defer stop()
-		defer close(lance)
 		lancer := NewLancer(float64(*low), float64(*high), *duration)
 		return lancer.Lance(ctx, lance)
 	})
