@@ -121,7 +121,7 @@ func (l *Lancer) Lance(ctx context.Context, lance chan time.Duration) error {
 // Hit contains info about request timings, sizes and statuses
 // TODO: add ConnectTime, SendTime, ReceiveTime, SizeOut, NetCode
 type Hit struct {
-	Timestamp         time.Time
+	Path              string
 	Tick, TotalTime   time.Duration
 	SizeIn, ProtoCode int
 	Error             error
@@ -142,22 +142,29 @@ func Worker(ctx context.Context, spears chan *http.Request,
 		}
 		readyWorkers <- -1
 		t := time.Now()
-		resp, err := http.DefaultTransport.RoundTrip(spear)
-		if err != nil {
-			hits <- Hit{
-				Timestamp: t,
-				Error:     err,
-			}
-			return nil
-		}
-		body, err := ioutil.ReadAll(resp.Body)
 		// TODO: use httptrace module to get additional info
-		hits <- Hit{
-			Timestamp: t,
-			Tick:      tick,
-			ProtoCode: resp.StatusCode,
-			TotalTime: time.Now().Sub(t),
-			SizeIn:    len(body),
+		resp, err := http.DefaultTransport.RoundTrip(spear)
+		if err == nil {
+			var body []byte
+			body, err = ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err == nil {
+				hits <- Hit{
+					Tick:      tick,
+					Path:      spear.URL.Path,
+					ProtoCode: resp.StatusCode,
+					TotalTime: time.Now().Sub(t),
+					SizeIn:    len(body),
+				}
+			} else {
+				hits <- Hit{
+					Error: err,
+				}
+			}
+		} else {
+			hits <- Hit{
+				Error: err,
+			}
 		}
 	}
 	return nil
@@ -231,8 +238,17 @@ func main() {
 		// TODO: influxdb output
 		// TODO: phout output
 		// TODO: overload.yandex.ru output
+		running := true
+		for running {
+			select {
+			case hit := <-hits:
+				fmt.Printf("%v\n", hit)
+			case <-ctx.Done():
+				running = false
+			}
+		}
 		for hit := range hits {
-			fmt.Printf("%v\n", hit)
+			log.Printf("Response after stop: %v", hit)
 		}
 		return nil
 	})
