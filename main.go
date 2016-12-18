@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,8 +34,7 @@ func Parse(ctx context.Context, filename, scheme, target string, spears chan *ht
 		url := fmt.Sprintf("%s://%s%s", scheme, target, path)
 		req, err := http.NewRequest(method, url, nil)
 		if err != nil {
-			log.Printf("NewRequest failed: %s", err)
-			continue
+			return fmt.Errorf("can't construct request: %s", err)
 		}
 		select {
 		case spears <- req:
@@ -90,8 +90,8 @@ func (l *Lancer) Lance(ctx context.Context, lance chan struct{}) error {
 		tickTime := l.tickTime(i)
 		dt := start.Add(tickTime).Sub(time.Now())
 		if dt < 0 {
-			return fmt.Errorf("missed time for lance %d: %s -> %s",
-				i, l.tickTime(i-1), l.tickTime(i))
+			return fmt.Errorf("missed time for lance near %.1f RPS",
+				float64(time.Second)/float64(l.tickTime(i)-l.tickTime(i-1)))
 		}
 		time.Sleep(dt)
 		select {
@@ -120,27 +120,23 @@ func Worker(ctx context.Context, spears chan *http.Request, lance chan struct{},
 		case <-ctx.Done():
 			return nil
 		}
-		// TODO: get rid of creating a goroutine per request, use a dynamic
-		// pool of workers
-		go func(spear *http.Request) {
-			t := time.Now()
-			resp, err := http.DefaultTransport.RoundTrip(spear)
-			if err != nil {
-				hits <- Hit{
-					Timestamp: t,
-					Error:     err,
-				}
-				return
-			}
-			body, err := ioutil.ReadAll(resp.Body)
-			// TODO: get additional info from transport layer
+		t := time.Now()
+		resp, err := http.DefaultTransport.RoundTrip(spear)
+		if err != nil {
 			hits <- Hit{
 				Timestamp: t,
-				ProtoCode: resp.StatusCode,
-				TotalTime: time.Now().Sub(t),
-				SizeIn:    len(body),
+				Error:     err,
 			}
-		}(spear)
+			return nil
+		}
+		body, err := ioutil.ReadAll(resp.Body)
+		// TODO: use httptrace module to get additional info
+		hits <- Hit{
+			Timestamp: t,
+			ProtoCode: resp.StatusCode,
+			TotalTime: time.Now().Sub(t),
+			SizeIn:    len(body),
+		}
 	}
 	return nil
 }
@@ -158,7 +154,7 @@ func main() {
 
 	spears := make(chan *http.Request)
 	lance := make(chan struct{})
-	hits := make(chan Hit)
+	hits := make(chan Hit, 10000)
 
 	ctx, stop := context.WithCancel(context.Background())
 	g, ctx := errgroup.WithContext(ctx)
@@ -170,7 +166,16 @@ func main() {
 
 	g.Go(func() error {
 		defer close(hits)
-		return Worker(ctx, spears, lance, hits)
+		var wg sync.WaitGroup
+		for i := 0; i < 10240; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				Worker(ctx, spears, lance, hits)
+			}()
+		}
+		wg.Wait()
+		return nil
 	})
 
 	g.Go(func() error {
