@@ -58,9 +58,6 @@ type Lancer struct {
 
 // NewLancer creates a new Lancer object
 func NewLancer(low, high float64, duration time.Duration) *Lancer {
-	if low == high {
-		return nil
-	}
 	durationSeconds := float64(duration) / float64(time.Second)
 	return &Lancer{
 		low:             low,
@@ -73,6 +70,9 @@ func NewLancer(low, high float64, duration time.Duration) *Lancer {
 }
 
 func (l *Lancer) tickTime(n int) time.Duration {
+	if l.slope == 0 {
+		return time.Duration(float64(n*int(time.Second)) / l.low)
+	}
 	ret := (math.Sqrt(l.lowSq+2*l.slope*float64(n)) - l.low) / l.slope
 	return time.Duration(ret * float64(time.Second))
 }
